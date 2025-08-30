@@ -1,30 +1,33 @@
-# Colab OTIF report script (auto-detect .xls/.xlsx, normalize columns, same logic as before)
-# Run this cell in Google Colab. When prompted, upload your Excel file.
-
-# Install helpful packages (quiet)
-
+# pages/4_Vendor_OTIF.py
+# Streamlit OTIF vendor analysis page
+# Save to pages/4_Vendor_OTIF.py in your multipage Streamlit repo.
 
 import io
 import os
 import re
-import sys
 from datetime import datetime
 import pandas as pd
 import numpy as np
+import streamlit as st
+import plotly.express as px
 
-# Reportlab imports for PDF
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import mm
+# Try to import reportlab for PDF generation
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import mm
+    reportlab_available = True
+except Exception:
+    reportlab_available = False
 
-# ---------- CONFIG / MAPPINGS ----------
-# Placeholder item-category mapping (extend with your real map)
-df1 = pd.DataFrame({
-    'Material Code': ['4AO005', '1DAT04S', '1DCT01', '2AE06', '2CC02', '4BT021G', '2AB01-C', '4BT008G', '4BT011G'],
-    'Item Category': ['Seal', 'Vial', 'Vial', 'Ampoule', 'Ampoule', 'Seal', 'Ampoule', 'Seal', 'Seal']
-})
+st.set_page_config(page_title="Vendor OTIF Analysis", page_icon="📦", layout="wide")
+st.title("📦 OTIF (On-Time In-Full) Analysis — Order Level")
+st.caption(
+    "Upload procurement/GRN Excel → we'll clean it, apply lead-time rules, compute PO-level In-Full, On-Time, and OTIF. "
+    "Use the Mat Type checkboxes in the left sidebar. Month bucketing uses the PO's last GRN date."
+)
 
-# Canonical column names used by the processing logic
+# ------------------------- CONSTANTS (canonical dotted columns) -------------------------
 COL_MAT_TYPE = 'Mat Type'
 COL_MATERIAL_CODE = 'Material Code'
 COL_MATERIAL_NAME = 'Material Name'
@@ -42,9 +45,14 @@ REQUIRED_COLS = [
     COL_PO_DT, COL_PO_NO, COL_SUPPLIER, COL_PO_QTY, COL_GNR_DT, COL_INWARD_QTY
 ]
 
+# Placeholder mapping (extend as required)
+df1 = pd.DataFrame({
+    'Material Code': ['4AO005', '1DAT04S', '1DCT01', '2AE06', '2CC02', '4BT021G', '2AB01-C', '4BT008G', '4BT011G'],
+    'Item Category': ['Seal', 'Vial', 'Vial', 'Ampoule', 'Ampoule', 'Seal', 'Ampoule', 'Seal', 'Seal']
+})
+
 DEFAULT_RULES = {"RM": 30, "SPM": 15, "TPM": 15}
 DEFAULT_PPM_LT = 30
-
 PPM_CATEGORY_MAP = {
     7:  ['Vial', 'Rubber Stopper', 'Rubber', 'Stopper', 'Seal', 'Cap', 'Collar', 'Inner Cap', 'Outer Cap'],
     12: ['Ampoule', 'Amp'],
@@ -52,108 +60,78 @@ PPM_CATEGORY_MAP = {
     15: ['Al Tube', 'Plastic Bottle', 'Plastic Nozzle', 'Nozzle'],
 }
 
-# Colab-specific behavior: default lead time assigned to unknown Mat Types (change if needed)
-DEFAULT_UNKNOWN_LEAD_TIME = 30   # days assigned if Mat Type is unknown
-# Optional override dict (set before uploading if you wish)
-# Example: custom_lead_times = {"CUSTOMTYPE": 20}
-custom_lead_times = {}
+DEFAULT_UNKNOWN_LEAD_TIME = 30
+custom_lead_times = {}  # optional override dict (leave empty or set before use)
 
-# ---------- UTILITIES: robust Excel reading & column normalization ----------
-def read_excel_auto(path_or_buffer):
+# ------------------------- HELPERS -------------------------
+def try_read_excel(uploaded_file):
     """
-    Read an excel file (path or file-like) while auto-selecting the engine based on file extension.
-    Works with .xls (xlrd) and .xlsx/.xlsm (openpyxl). Falls back if necessary.
+    Try read using openpyxl then xlrd. Returns DataFrame or raises informative error.
+    uploaded_file: Streamlit UploadedFile (has .name and is file-like)
     """
-    # If a path-like string was passed, we can inspect the extension
-    engine = None
-    fname = None
-
-    # If the argument is a path string
-    if isinstance(path_or_buffer, str):
-        fname = path_or_buffer
-        ext = os.path.splitext(fname)[1].lower()
-        if ext == '.xls':
-            engine = 'xlrd'
-        elif ext in ('.xlsx', '.xlsm', '.xltx', '.xltm'):
-            engine = 'openpyxl'
-        else:
-            # unknown extension: try openpyxl then xlrd
-            engine = None
-
-        if engine:
-            try:
-                df = pd.read_excel(fname, engine=engine)
-                print(f"Read '{fname}' using engine='{engine}'.")
-                return df
-            except Exception as e:
-                print(f"Failed reading with engine='{engine}': {e}. Will attempt fallbacks.")
-                # fallthrough to generic attempts
-
-    # If argument is file-like (e.g., BytesIO), try openpyxl first, then xlrd
-    attempts = []
+    # rewind
     try:
-        # prefer openpyxl for modern xlsx files
-        df = pd.read_excel(path_or_buffer, engine='openpyxl')
-        print("Read Excel using engine='openpyxl'.")
-        return df
-    except Exception as e_open:
-        attempts.append(("openpyxl", str(e_open)))
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+
+    errors = []
+    for engine in ("openpyxl", "xlrd", None):
         try:
-            df = pd.read_excel(path_or_buffer, engine='xlrd')
-            print("Read Excel using engine='xlrd'.")
+            if engine is None:
+                df = pd.read_excel(uploaded_file)  # let pandas choose
+            else:
+                df = pd.read_excel(uploaded_file, engine=engine)
             return df
-        except Exception as e_xl:
-            attempts.append(("xlrd", str(e_xl)))
-            # If both fail, surface a helpful message
-            msg = "Failed to read Excel file. Attempts:\n"
-            for eng, err in attempts:
-                msg += f" - engine={eng}: {err}\n"
-            raise ValueError(msg)
+        except Exception as e:
+            errors.append((engine, str(e)))
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
+    msg = "Failed to read Excel file. Tried engines:\n"
+    for eng, err in errors:
+        msg += f" - engine={eng}: {err}\n"
+    raise ValueError(msg)
 
 def standardize_column_names(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Robustly map many variants of column names to canonical names used by the script.
-    Preserves any columns not recognized (they remain with near-original name, cleaned).
+    Map many column name variants to canonical dotted names used in logic.
+    Preserves other columns.
     """
-    def map_one(col):
-        orig = str(col).strip()
-        # clean spaces and NBSP
-        s = re.sub(r'\u00A0', ' ', orig)
+    def canon(col):
+        s = str(col).strip()
+        s = re.sub(r'\u00A0', ' ', s)
         s = re.sub(r'\s+', ' ', s).strip()
-        key = re.sub(r'[\s\.\-_/()]', '', s).lower()
-
-        # mapping dictionary based on common variants
-        if key in ('mattype','materialtype'):
+        k = re.sub(r'[^A-Za-z0-9]', '', s).lower()
+        # map variants
+        if k in ('mattype','materialtype'):
             return COL_MAT_TYPE
-        if key in ('materialcode','matcode','material_code'):
+        if k in ('materialcode','matcode','material_code'):
             return COL_MATERIAL_CODE
-        if key in ('materialname','itemname','material'):
+        if k in ('materialname','itemname','material'):
             return COL_MATERIAL_NAME
-        if key == 'uom':
+        if k == 'uom':
             return COL_UOM
-        if key in ('podt','podat','podate','podatet','podt'):
+        if k in ('podt','podat','podate','podate'):
             return COL_PO_DT
-        if key in ('pono','ponumber','po'):
+        if k in ('pono','ponumber','po'):
             return COL_PO_NO
-        if key in ('supplier','suppliername'):
+        if k in ('supplier','suppliername'):
             return COL_SUPPLIER
-        if key in ('poqty','poqty','purchaseorderqty','quantityordered'):
+        if k in ('poqty','purchaseorderqty','quantityordered','quantity'):
             return COL_PO_QTY
-        if key in ('gnrdt','grndt','grndate','grn','grndate'):
+        if k in ('gnrdt','grndt','grndate','grn','grndate'):
             return COL_GNR_DT
-        if key in ('inwardqty','inwardquantity','receivedqty','receivedquantity'):
+        if k in ('inwardqty','inwardquantity','receivedqty','receivedquantity'):
             return COL_INWARD_QTY
-        if key in ('itemcategory','itemcat','category'):
+        if k in ('itemcategory','itemcat','category'):
             return COL_ITEM_CAT
-        # else return the cleaned original (preserve punctuation if user wants)
-        return orig
+        return col  # keep original
+    df2 = df.copy()
+    df2.columns = [canon(c) for c in df.columns]
+    return df2
 
-    new_cols = [map_one(c) for c in df.columns]
-    df = df.copy()
-    df.columns = new_cols
-    return df
-
-# ---------- HELPERS: original logic, but using canonical column variables ----------
 def compute_lead_time_for_row(row: pd.Series, rules: dict):
     mat_type = str(row.get(COL_MAT_TYPE, "")).strip().upper()
     if mat_type in rules:
@@ -167,6 +145,19 @@ def compute_lead_time_for_row(row: pd.Series, rules: dict):
                     return lt
         return DEFAULT_PPM_LT
     return np.nan
+
+@st.cache_data(show_spinner=True)
+def load_and_clean(file):
+    # file is Streamlit UploadedFile (or file-like)
+    df = try_read_excel(file)
+    df = standardize_column_names(df)
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Input file missing required columns: {missing}. Columns found: {list(df.columns)}")
+    # select only required columns and optional Item Category if present
+    extras = [c for c in [COL_ITEM_CAT] if c in df.columns]
+    df = df[REQUIRED_COLS + extras].copy()
+    return df
 
 def ensure_types_and_drop_nulls(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -235,7 +226,13 @@ def compute_po_level_metrics(df: pd.DataFrame):
 
     return df_line, df_po
 
-def generate_failed_orders_pdf_colab(breaches_df: pd.DataFrame, vendor_stats: pd.DataFrame, year: int, output_path: str):
+def generate_failed_orders_pdf(breaches_df: pd.DataFrame, vendor_stats: pd.DataFrame, year: int) -> bytes:
+    """
+    Create a PDF of failed OTIF orders grouped by Supplier. Returns PDF bytes.
+    """
+    if not reportlab_available:
+        raise RuntimeError("reportlab not available")
+
     buf = io.BytesIO()
     width, height = A4
     c = canvas.Canvas(buf, pagesize=A4)
@@ -243,6 +240,7 @@ def generate_failed_orders_pdf_colab(breaches_df: pd.DataFrame, vendor_stats: pd
     y = height - 20 * mm
     line_height = 8 * mm
 
+    # Title
     c.setFont("Helvetica-Bold", 16)
     c.drawString(margin_x, y, f"ALL OTIF FAILED ORDERS — {year}")
     y -= 12 * mm
@@ -251,14 +249,15 @@ def generate_failed_orders_pdf_colab(breaches_df: pd.DataFrame, vendor_stats: pd
 
     vendor_idx = 1
     for _, vr in vendor_order.iterrows():
-        vendor = vr["Supplier"]
+        vendor = vr[COL_SUPPLIER]
         failures = int(vr["OTIF_Failures"])
         total_orders = int(vr["Total_Orders"])
         otif_pct = float(vr["Vendor_OTIF_pct"])
         contrib_pct = float(vr["Total_Contribution_pct"])
 
-        vendor_group = breaches_df[breaches_df["Supplier"] == vendor].sort_values(COL_GNR_DT, ascending=False)
+        vendor_group = breaches_df[breaches_df[COL_SUPPLIER] == vendor].sort_values(COL_GNR_DT, ascending=False)
 
+        # New page header if near bottom
         if y < 40 * mm:
             c.showPage()
             y = height - 20 * mm
@@ -267,7 +266,7 @@ def generate_failed_orders_pdf_colab(breaches_df: pd.DataFrame, vendor_stats: pd
             y -= 12 * mm
 
         c.setFont("Helvetica-Bold", 12)
-        header = f"{vendor_idx}. {vendor}   (Failures: {failures})   OTIF: {otif_pct:.1f}%   Contribution: {contrib_pct:.1f}%   Total Orders: {total_orders}"
+        header = f"{vendor_idx}. {vendor}  (Failures: {failures})  OTIF: {otif_pct:.1f}%  Contribution: {contrib_pct:.1f}%  Total Orders: {total_orders}"
         c.drawString(margin_x, y, header)
         y -= line_height
 
@@ -288,76 +287,103 @@ def generate_failed_orders_pdf_colab(breaches_df: pd.DataFrame, vendor_stats: pd
 
     c.save()
     buf.seek(0)
-    with open(output_path, "wb") as f:
-        f.write(buf.read())
-    print(f"PDF written to: {output_path}")
+    return buf.getvalue()
 
-# ---------- RUN: Upload file & process ----------
-from google.colab import files
-uploaded = files.upload()
-if not uploaded:
-    raise SystemExit("No file uploaded.")
-# take the first uploaded file
-file_name = list(uploaded.keys())[0]
-print("Uploaded:", file_name)
+# ------------------------- MAIN -------------------------
+# File uploader (persistent across pages)
+if not st.session_state.get("data_file_loaded"):
+    uploaded = st.file_uploader("📤 Upload OTIF Excel (single sheet expected)", type=["xlsx", "xls"])
+else:
+    uploaded = None
 
-# Read Excel with auto-detection
+# allow reusing main app-uploaded file if present
+if "uploaded_file" in st.session_state and st.session_state["uploaded_file"] is not None:
+    uploaded = st.session_state["uploaded_file"]
+
+# store in session state if new upload
+if uploaded is not None:
+    st.session_state["uploaded_file"] = uploaded
+    st.session_state["data_file_loaded"] = True
+
+if not st.session_state.get("data_file_loaded"):
+    st.info("Upload your Excel to begin. Expected columns (variants accepted): Mat Type, Material Code, Material Name, UOM, P.O. Dt., P. O. No., Supplier, PO Qty., GNR Dt., Inward Qty.")
+    st.stop()
+
+# Load and clean
 try:
-    df_raw = read_excel_auto(file_name)
+    df_raw = load_and_clean(st.session_state["uploaded_file"])
 except Exception as e:
-    # Provide the detailed exception so user can inspect
-    raise RuntimeError(f"Error reading Excel file: {e}")
+    st.error(f"❌ Processing error: {e}")
+    st.stop()
 
-# Normalize column names to canonical names (accepts dotted or non-dotted variants)
-df_raw = standardize_column_names(df_raw)
-missing = [c for c in REQUIRED_COLS if c not in df_raw.columns]
-if missing:
-    raise ValueError(f"Input file missing required columns (after normalization): {missing}. Columns found: {list(df_raw.columns)}")
-
-# Convert dtypes & drop nulls (will use canonical names)
-df_raw = ensure_types_and_drop_nulls(df_raw)
 if df_raw.empty:
-    raise ValueError("No usable rows after type coercion / dropping nulls.")
+    st.warning("No rows found after basic load.")
+    st.stop()
 
-# Merge Item Category mapping (if Item Category not present, merge from df1)
-df = merge_item_category(df_raw)
+# Sidebar: Mat Type filters
+st.sidebar.header("🎛 Mat Type Filters & Lead Times")
+all_types = sorted(df_raw[COL_MAT_TYPE].dropna().astype(str).unique().tolist())
+select_all = st.sidebar.checkbox("Select ALL Mat Types", value=True)
+selected_types = []
 
-# Lead-time rules: known defaults + user overrides (custom_lead_times)
+if select_all:
+    selected_types = all_types
+else:
+    st.sidebar.caption("Tick the Mat Types you want to include:")
+    for t in all_types:
+        if st.sidebar.checkbox(f"{t}", value=False, key=f"mt_{t}"):
+            selected_types.append(t)
+
+if not selected_types:
+    st.warning("Please select at least one Mat Type from the sidebar.")
+    st.stop()
+
+# Filter to chosen Mat Types
+df = df_raw[df_raw[COL_MAT_TYPE].astype(str).isin(selected_types)].copy()
+if df.empty:
+    st.warning("No rows remain after Mat Type filtering.")
+    st.stop()
+
+# Convert dtypes & drop critical nulls
+df = ensure_types_and_drop_nulls(df)
+if df.empty:
+    st.warning("No rows remain after dropping records with missing dates/quantities.")
+    st.stop()
+
+# Merge Item Category mapping
+df = merge_item_category(df)
+
+# Lead time rules: defaults + UI inputs for unknown selected types (except PPM)
 lead_time_rules = DEFAULT_RULES.copy()
-# apply overrides from custom_lead_times dict (if user configured)
-if custom_lead_times:
-    for k, v in custom_lead_times.items():
-        lead_time_rules[str(k).strip().upper()] = int(v)
+unknown_selected = [t for t in selected_types if t.upper() not in lead_time_rules and t.upper() != "PPM"]
 
-# Detect Mat Types present and auto-assign default lead times for unknown Mat Types
-mat_types_in_data = set(df[COL_MAT_TYPE].dropna().astype(str).str.strip().str.upper().unique().tolist())
-known_keys = set(lead_time_rules.keys()) | set(["PPM"])
-unknowns = sorted(mat_types_in_data - known_keys)
+if unknown_selected:
+    st.sidebar.subheader("⏱ Lead Time (days) for other Mat Types")
+for t in unknown_selected:
+    lead_time_rules[t.upper()] = st.sidebar.number_input(
+        f"Lead Time for {t}", min_value=1, max_value=365, value=30, step=1, key=f"lt_{t}"
+    )
 
-if unknowns:
-    print("Found Mat Types with no specified lead time. Assigning default lead time (days) to them:")
-    for u in unknowns:
-        print(f"  - {u} -> {DEFAULT_UNKNOWN_LEAD_TIME} days")
-        lead_time_rules[u] = DEFAULT_UNKNOWN_LEAD_TIME
-
-# Compute Lead Time for each row
+# compute Lead Time
 df["Lead Time"] = df.apply(lambda row: compute_lead_time_for_row(row, lead_time_rules), axis=1)
-
-# Final fallback — if any rows still have NaN lead time, fill with default and notify
 if df["Lead Time"].isna().any():
-    print("Warning: Some rows still lack Lead Time; filling with DEFAULT_UNKNOWN_LEAD_TIME.")
-    print(df.loc[df["Lead Time"].isna(), [COL_MAT_TYPE]].drop_duplicates().head(10).to_string(index=False))
-    df["Lead Time"] = df["Lead Time"].fillna(DEFAULT_UNKNOWN_LEAD_TIME)
+    bad = df.loc[df["Lead Time"].isna(), COL_MAT_TYPE].unique().tolist()
+    st.error(f"Lead Time missing for Mat Types: {bad}. Please provide values in the sidebar.")
+    st.stop()
 
 # PO-level metrics
 df_line, df_po = compute_po_level_metrics(df)
+if df_po.empty:
+    st.warning("No P.O. rows available after processing.")
+    st.stop()
 
+# Year selection (based on last GRN date per PO)
 years = sorted(df_po["Year"].dropna().unique().astype(int).tolist())
 if not years:
-    raise ValueError("No valid years found in processed data.")
-selected_year = years[-1]  # choose most recent by default
-print("Selected year:", selected_year)
+    st.error("No valid 'GNR Dt.' years found after processing.")
+    st.stop()
 
+selected_year = st.selectbox("📅 Select Year", years, index=len(years)-1)
 po_year = df_po[df_po["Year"] == selected_year].copy()
 
 # Monthly summary
@@ -372,7 +398,54 @@ monthly = (
            .sort_values("MonthNum")
 )
 
-# Vendor stats for the selected year
+overall_yearly = po_year["OTIF"].mean()
+
+# KPIs
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("OTIF (Yearly PO-level mean)", f"{(overall_yearly*100):.1f}%")
+k2.metric("On-Time (Yearly mean)", f"{(po_year['OnTime'].mean()*100):.1f}%")
+k3.metric("In-Full (Yearly mean)", f"{(po_year['PO_Fulfilled'].mean()*100):.1f}%")
+k4.metric("Total Orders (Year)", int(po_year.shape[0]))
+
+# Monthly chart
+st.subheader("📊 Monthly OTIF (Selected Year)")
+if monthly.empty:
+    st.info("No orders for the selected year.")
+else:
+    month_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    present = [m for m in month_order if m in monthly["Month"].tolist()]
+    fig = px.bar(
+        monthly,
+        x="Month",
+        y="Avg_OTIF",
+        category_orders={"Month": present},
+        text=monthly["Avg_OTIF"].map(lambda v: f"{v*100:.1f}%"),
+        labels={"Month": "Month", "Avg_OTIF": "Average OTIF"},
+        height=420
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_yaxes(range=[0, 1], tickformat=".0%")
+    fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+# Monthly table
+with st.expander("📄 Monthly Summary Table"):
+    tbl = monthly.copy()
+    for c in ["Avg_OTIF", "Avg_OnTime", "Avg_InFull"]:
+        tbl[c] = (tbl[c] * 100).round(1)
+    tbl = tbl.rename(columns={
+        "MonthNum": "Month #",
+        "Avg_OTIF": "Avg OTIF (%)",
+        "Avg_OnTime": "Avg On-Time (%)",
+        "Avg_InFull": "Avg In-Full (%)",
+    })
+    st.dataframe(tbl, use_container_width=True)
+
+# Top 10 Vendors with breaches
+st.subheader("🚨 Top 10 Vendors with OTIF Breaches (Selected Year)")
+breaches = po_year[po_year["OTIF"] == 0].copy()
+
+# Vendor stats for the year
 total_orders_year = po_year.shape[0]
 vendor_stats = (
     po_year.groupby(COL_SUPPLIER, dropna=False)
@@ -385,34 +458,66 @@ vendor_stats[COL_SUPPLIER] = vendor_stats[COL_SUPPLIER].fillna("Unknown Supplier
 vendor_stats["Vendor_OTIF_pct"] = vendor_stats["OTIF_Success"] / vendor_stats["Total_Orders"] * 100
 vendor_stats["Total_Contribution_pct"] = vendor_stats["Total_Orders"] / (total_orders_year if total_orders_year>0 else 1) * 100
 
-# Top 10 vendors by failures
-top10 = vendor_stats[vendor_stats["OTIF_Failures"]>0].sort_values("OTIF_Failures", ascending=False).head(10)
-if top10.empty:
-    print("No OTIF failures found in selected year.")
+if breaches.empty:
+    st.success("No OTIF breaches in the selected year. 🎉")
+    top10 = pd.DataFrame(columns=[COL_SUPPLIER, "OTIF_Failures", "Vendor_OTIF_pct", "Total_Contribution_pct", "Total_Orders"])
+    st.dataframe(top10, use_container_width=True)
 else:
-    # Format and display top10
+    top10 = vendor_stats[vendor_stats["OTIF_Failures"]>0].sort_values("OTIF_Failures", ascending=False).head(10)
     display_top10 = top10[[COL_SUPPLIER, "OTIF_Failures", "Vendor_OTIF_pct", "Total_Contribution_pct", "Total_Orders"]].copy()
     display_top10["Vendor_OTIF_pct"] = display_top10["Vendor_OTIF_pct"].map(lambda v: f"{v:.1f}%")
     display_top10["Total_Contribution_pct"] = display_top10["Total_Contribution_pct"].map(lambda v: f"{v:.1f}%")
-    print("\nTop vendors (failures, OTIF%, contribution%):")
-    print(display_top10.to_string(index=False))
+    st.dataframe(display_top10.reset_index(drop=True), use_container_width=True)
 
-# Save CSVs
-po_csv = f"po_level_{selected_year}.csv"
-monthly_csv = f"monthly_otif_{selected_year}.csv"
-po_year.to_csv(po_csv, index=False)
-monthly.to_csv(monthly_csv, index=False)
-print(f"Saved: {po_csv}, {monthly_csv}")
+    # PDF download of failed orders grouped by supplier (include percentages in headings)
+    if reportlab_available:
+        try:
+            pdf_bytes = generate_failed_orders_pdf(breaches[[COL_SUPPLIER, COL_GNR_DT, COL_PO_NO]], vendor_stats, selected_year)
+            st.download_button(
+                "⬇️ Download ALL Failed Orders (PDF)",
+                data=pdf_bytes,
+                file_name=f"OTIF_failed_orders_{selected_year}.pdf",
+                mime="application/pdf"
+            )
+        except Exception as e:
+            st.error(f"Error generating PDF: {e}")
+            csv_bytes = breaches[[COL_SUPPLIER, COL_GNR_DT, COL_PO_NO]].sort_values([COL_SUPPLIER, COL_GNR_DT], ascending=[False, False]).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download ALL Failed Orders (CSV fallback)",
+                data=csv_bytes,
+                file_name=f"OTIF_failed_orders_{selected_year}.csv",
+                mime="text/csv"
+            )
+    else:
+        st.warning("PDF export requires the `reportlab` package. Install it in your environment (requirements.txt).")
+        csv_bytes = breaches[[COL_SUPPLIER, COL_GNR_DT, COL_PO_NO]].sort_values([COL_SUPPLIER, COL_GNR_DT], ascending=[False, False]).to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download ALL Failed Orders (CSV)",
+            data=csv_bytes,
+            file_name=f"OTIF_failed_orders_{selected_year}.csv",
+            mime="text/csv"
+        )
 
-# Generate PDF for failures (grouped by supplier)
-breaches = po_year[po_year["OTIF"] == 0].copy()
-if breaches.shape[0] == 0:
-    print("No OTIF breaches in selected year.")
-else:
-    out_pdf = f"OTIF_failed_orders_{selected_year}.pdf"
-    generate_failed_orders_pdf_colab(breaches[[COL_SUPPLIER, COL_GNR_DT, COL_PO_NO]], vendor_stats, selected_year, out_pdf)
-    # Offer file for download in Colab:
-    from google.colab import files as gfiles
-    gfiles.download(out_pdf)
+# Download PO-level & monthly data
+col1, col2 = st.columns([1.5, 1])
+with col1:
+    st.download_button(
+        "⬇️ Download PO-level Data (CSV)",
+        data=po_year.to_csv(index=False).encode("utf-8"),
+        file_name=f"po_level_{selected_year}.csv",
+        mime="text/csv",
+    )
+with col2:
+    st.download_button(
+        "⬇️ Download Monthly Summary (CSV)",
+        data=monthly.to_csv(index=False).encode("utf-8"),
+        file_name=f"monthly_otif_{selected_year}.csv",
+        mime="text/csv",
+    )
 
-print("Completed processing.")
+with st.expander("🔎 Debug / Sanity"):
+    st.write("Selected Mat Types:", selected_types)
+    st.write("Lead Time Rules (non-PPM):", lead_time_rules)
+    st.write("Number of POs in year:", int(po_year.shape[0]))
+    st.write("Overall yearly (PO-level OTIF):", overall_yearly)
+
