@@ -8,7 +8,7 @@ Original file is located at
 """
 
 # -*- coding: utf-8 -*-
-"""app.py"""
+
 
 import streamlit as st
 
