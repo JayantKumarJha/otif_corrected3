@@ -49,7 +49,7 @@ st.markdown("""
 
 # Title
 st.markdown("<div class='title'>👋 Welcome to <span style='color:#2980b9'>SWISS</span></div>", unsafe_allow_html=True)
-st.markdown("<div class='subtitle'>Your Smart Production Scheduling Platform</div>", unsafe_allow_html=True)
+st.markdown("<div class='subtitle'>Your Smart Operations Review Platform</div>", unsafe_allow_html=True)
 
 # Info Card
 st.markdown("""
