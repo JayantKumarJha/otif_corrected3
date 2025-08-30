@@ -60,8 +60,8 @@ st.markdown("""
         <ul style='font-size:16px; line-height:1.6'>
             <li>💉 <b>Ampoule Scheduler</b> – Plan production for ampoule lines with overrideable speed settings.</li>
             <li>🧪 <b>Vial Scheduler</b> – Schedule batches for vials with type-aware speed control (e.g., 2m vs 2t).</li>
-            <li>📊 <b>Production Dashboard</b> – View daily performance metrics, KPIs, and trends across both lines. No upload needed!</li>
             <li>📦 <b>OTIF Analysis</b> – Upload your P.O. data to calculate On-Time, In-Full, and OTIF performance, plus monthly summaries and vendor insights.</li>
+            <li>📊 <b>TAT Analysis </b> – View the turn around time for several products for qc department,can be used for other department as well if data format is same. </li>
         </ul>
     </div>
 """, unsafe_allow_html=True)
