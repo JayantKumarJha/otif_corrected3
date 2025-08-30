@@ -2,7 +2,7 @@
 # Run this cell in Google Colab. When prompted, upload your Excel file.
 
 # Install helpful packages (quiet)
-!pip install --quiet openpyxl xlrd reportlab
+
 
 import io
 import os
